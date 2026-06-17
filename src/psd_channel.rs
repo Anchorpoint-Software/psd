@@ -127,7 +127,12 @@ pub trait IntoRgba {
 
                 for (idx, byte) in channel_bytes.iter().enumerate() {
                     if let Some(rgba_idx) = self.rgba_idx(idx) {
-                        rgba[rgba_idx * 4 + offset] = *byte;
+                        // Bounds-checked: a malformed file can declare smaller canvas
+                        // dimensions than its channel data; drop the overflow instead of
+                        // panicking (mirrors the RLE path).
+                        if let Some(slot) = rgba.get_mut(rgba_idx * 4 + offset) {
+                            *slot = *byte;
+                        }
                     }
                 }
             }

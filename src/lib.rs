@@ -19,7 +19,7 @@ use sections::layer_and_mask_information_section::layer::PsdLayerError;
 
 use crate::psd_channel::IntoRgba;
 pub use crate::psd_channel::{PsdChannelCompression, PsdChannelKind};
-pub use crate::sections::file_header_section::{ColorMode, PsdDepth};
+pub use crate::sections::file_header_section::{ColorMode, PsdDepth, PsdVersion};
 use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::image_data_section::ImageDataSection;
 pub use crate::sections::image_resources_section::ImageResource;
@@ -57,12 +57,15 @@ pub enum PsdError {
     ResourceError(ImageResourcesSectionError),
 }
 
-/// Represents the contents of a PSD file
+/// Represents the contents of a PSD or PSB file.
 ///
 /// ## PSB Support
 ///
-/// We do not currently support PSB since the original authors didn't need it, but adding
-/// support should be trivial. If you'd like to support PSB please open an issue.
+/// Both Photoshop's standard PSD (version 1) and the Large Document Format PSB
+/// (version 2) are supported. PSB widens several length fields (the layer & mask
+/// section length, the layer-info length, per-channel data lengths and the RLE
+/// scanline byte counts); these are read with the correct width based on the
+/// file's [`PsdVersion`]. The public API is identical for both.
 #[derive(Debug)]
 pub struct Psd {
     file_header_section: FileHeaderSection,
@@ -89,6 +92,7 @@ impl Psd {
         let file_header_section = FileHeaderSection::from_bytes(major_sections.file_header)
             .map_err(PsdError::HeaderError)?;
 
+        let version = file_header_section.version();
         let psd_width = file_header_section.width.0;
         let psd_height = file_header_section.height.0;
         let channel_count = file_header_section.channel_count.count();
@@ -97,6 +101,7 @@ impl Psd {
             major_sections.layer_and_mask,
             psd_width,
             psd_height,
+            version,
         )
         .map_err(PsdError::LayerError)?;
 
@@ -105,6 +110,7 @@ impl Psd {
             file_header_section.depth,
             psd_height,
             channel_count,
+            version,
         )
         .map_err(PsdError::ImageError)?;
 
@@ -123,6 +129,12 @@ impl Psd {
 
 // Methods for working with the file section header
 impl Psd {
+    /// The version of the file: [`PsdVersion::One`] for a standard PSD,
+    /// [`PsdVersion::Two`] for a PSB (Large Document Format).
+    pub fn version(&self) -> PsdVersion {
+        self.file_header_section.version()
+    }
+
     /// The width of the PSD file
     pub fn width(&self) -> u32 {
         self.file_header_section.width.0

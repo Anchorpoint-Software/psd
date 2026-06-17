@@ -1,4 +1,5 @@
 use crate::psd_channel::PsdChannelCompression;
+use crate::sections::file_header_section::PsdVersion;
 use crate::sections::PsdCursor;
 use crate::PsdDepth;
 use thiserror::Error;
@@ -14,6 +15,12 @@ pub enum ImageDataSectionError {
 
     #[error("{compression} is an invalid layer channel compression. Must be 0, 1, 2 or 3")]
     InvalidCompression { compression: u16 },
+
+    #[error(
+        r#"ZIP-compressed merged image data is not supported.
+    The composite cannot be decoded; the file degrades to a fallback thumbnail."#
+    )]
+    UnsupportedCompression,
 }
 
 /// The ImageDataSection comes from the final section in the PSD that contains the pixel data
@@ -52,6 +59,7 @@ impl ImageDataSection {
         depth: PsdDepth,
         psd_height: u32,
         channel_count: u8,
+        version: PsdVersion,
     ) -> Result<ImageDataSection, ImageDataSectionError> {
         let mut cursor = PsdCursor::new(bytes);
         let channel_count = channel_count as usize;
@@ -62,59 +70,46 @@ impl ImageDataSection {
 
         let (red, green, blue, alpha) = match compression {
             PsdChannelCompression::RawData => {
-                // First 2 bytes were compression bytes
-                let channel_bytes = &bytes[2..];
-                let channel_byte_count = channel_bytes.len();
-
-                let bytes_per_channel = channel_byte_count / channel_count;
-
-                // First bytes are red
-                let mut red = channel_bytes[..bytes_per_channel].into();
-
-                // Next bytes are green
-                let green = if channel_count >= 2 {
-                    Some(ChannelBytes::RawData(
-                        channel_bytes[bytes_per_channel..2 * bytes_per_channel].into(),
-                    ))
-                } else {
-                    None
-                };
-
-                // Then comes blue
-                let blue = if channel_count >= 3 {
-                    Some(ChannelBytes::RawData(
-                        channel_bytes[2 * bytes_per_channel..3 * bytes_per_channel].into(),
-                    ))
-                } else {
-                    None
-                };
-
-                // And optionally alpha bytes
-                let alpha = if channel_count == 4 {
-                    Some(ChannelBytes::RawData(
-                        channel_bytes[3 * bytes_per_channel..4 * bytes_per_channel].to_vec(),
-                    ))
-                } else {
-                    None
-                };
-
-                match depth {
-                    PsdDepth::Eight => (ChannelBytes::RawData(red), green, blue, alpha),
-                    // If this is a 16bit image there will be two bytes per pixel. We
-                    // currently only support one byte per pixel so we convert the 2 bytes
-                    // back down into 1 byte by mapping 0-65535 down to 0-255
-                    PsdDepth::Sixteen => {
-                        for idx in 0..red.len() / 2 {
-                            let bytes = [red[2 * idx], red[2 * idx + 1]];
-                            let bits16 = u16::from_be_bytes(bytes);
-                            red[idx] = (bits16 / 256) as u8;
-                        }
-                        red.truncate(red.len() / 2);
-
-                        (ChannelBytes::RawData(red), green, blue, alpha)
-                    }
-                    _ => return Err(ImageDataSectionError::UnsupportedDepth),
+                if !matches!(
+                    depth,
+                    PsdDepth::Eight | PsdDepth::Sixteen | PsdDepth::ThirtyTwo
+                ) {
+                    return Err(ImageDataSectionError::UnsupportedDepth);
                 }
+
+                // First 2 bytes were the compression marker.
+                let channel_bytes = bytes.get(2..).unwrap_or(&[]);
+                let bytes_per_channel = if channel_count == 0 {
+                    0
+                } else {
+                    channel_bytes.len() / channel_count
+                };
+
+                // Map every channel down to 8 bits per sample. 16-bit samples are two
+                // big-endian bytes (keep the high byte); 32-bit samples are linear-light
+                // floats, clamped and sRGB-encoded (see `linear_f32_to_u8`). (Previously
+                // only red was converted, leaving the other channels at full width and
+                // overflowing the RGBA buffer on render.)
+                let convert = |plane: &[u8]| -> Vec<u8> {
+                    match depth {
+                        PsdDepth::Sixteen => plane.chunks_exact(2).map(|s| s[0]).collect(),
+                        PsdDepth::ThirtyTwo => plane.chunks_exact(4).map(linear_f32_to_u8).collect(),
+                        _ => plane.to_vec(),
+                    }
+                };
+                let plane = |i: usize| -> &[u8] {
+                    let start = i * bytes_per_channel;
+                    channel_bytes
+                        .get(start..start + bytes_per_channel)
+                        .unwrap_or(&[])
+                };
+
+                let red = ChannelBytes::RawData(convert(plane(0)));
+                let green = (channel_count >= 2).then(|| ChannelBytes::RawData(convert(plane(1))));
+                let blue = (channel_count >= 3).then(|| ChannelBytes::RawData(convert(plane(2))));
+                let alpha = (channel_count >= 4).then(|| ChannelBytes::RawData(convert(plane(3))));
+
+                (red, green, blue, alpha)
             }
             // # [Adobe Docs](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)
             //
@@ -129,34 +124,46 @@ impl ImageDataSection {
                 let mut blue_byte_count = if channel_count >= 3 { Some(0) } else { None };
                 let mut alpha_byte_count = if channel_count == 4 { Some(0) } else { None };
 
+                // Each scanline byte-count entry is 2 bytes in a PSD and 4 bytes in a PSB.
+                let scanline_count_bytes = version.rle_scanline_len_bytes();
+                let mut read_scanline_count = |cursor: &mut PsdCursor| -> usize {
+                    if version.is_psb() {
+                        cursor.read_u32() as usize
+                    } else {
+                        cursor.read_u16() as usize
+                    }
+                };
+
                 for _ in 0..psd_height {
-                    red_byte_count += cursor.read_u16() as usize;
+                    red_byte_count += read_scanline_count(&mut cursor);
                 }
 
                 if let Some(ref mut green_byte_count) = green_byte_count {
                     for _ in 0..psd_height {
-                        *green_byte_count += cursor.read_u16() as usize;
+                        *green_byte_count += read_scanline_count(&mut cursor);
                     }
                 }
 
                 if let Some(ref mut blue_byte_count) = blue_byte_count {
                     for _ in 0..psd_height {
-                        *blue_byte_count += cursor.read_u16() as usize;
+                        *blue_byte_count += read_scanline_count(&mut cursor);
                     }
                 }
 
                 if let Some(ref mut alpha_byte_count) = alpha_byte_count {
                     for _ in 0..psd_height {
-                        *alpha_byte_count += cursor.read_u16() as usize;
+                        *alpha_byte_count += read_scanline_count(&mut cursor);
                     }
                 }
 
-                // 2 bytes for compression level, then 2 bytes for each scanline of each channel
-                // We're skipping over the bytes that describe the length of each scanling since
+                // 2 bytes for compression level, then the per-scanline byte counts for each
+                // channel (one entry per scanline of each channel).
+                // We're skipping over the bytes that describe the length of each scanline since
                 // we don't currently use them. We might re-think this in the future when we
                 // implement serialization of a Psd back into bytes.. But not a concern at the
                 // moment.
-                let channel_data_start = 2 + (channel_count * psd_height as usize * 2);
+                let channel_data_start =
+                    2 + (channel_count * psd_height as usize * scanline_count_bytes);
 
                 let (red_start, red_end) =
                     (channel_data_start, channel_data_start + red_byte_count);
@@ -199,14 +206,13 @@ impl ImageDataSection {
 
                 (ChannelBytes::RleCompressed(red), green, blue, alpha)
             }
-            PsdChannelCompression::ZipWithoutPrediction => unimplemented!(
-                r#"Zip without prediction compression is currently unsupported.
-                Please open an issue"#
-            ),
-            PsdChannelCompression::ZipWithPrediction => unimplemented!(
-                r#"Zip with prediction compression is currently unsupported.
-                Please open an issue"#
-            ),
+            // ZIP-compressed composites are rare (Photoshop almost always writes the
+            // merged image as raw or RLE). We don't decode ZIP, so return a clean error
+            // and let the caller fall back rather than unwinding.
+            PsdChannelCompression::ZipWithoutPrediction
+            | PsdChannelCompression::ZipWithPrediction => {
+                return Err(ImageDataSectionError::UnsupportedCompression)
+            }
         };
 
         Ok(ImageDataSection {
@@ -217,6 +223,27 @@ impl ImageDataSection {
             alpha,
         })
     }
+}
+
+/// Convert a big-endian 32-bit float sample to an 8-bit display value.
+///
+/// 32-bit PSD channels are linear-light floating point (the mode Photoshop uses for HDR),
+/// so they can't be bit-shifted like 16-bit. We clamp to [0, 1] and apply the sRGB
+/// transfer function. Validated against the OIIO `psd_rgb_8` vs `psd_rgb_32` pair (the
+/// same image at both depths): sRGB reproduces the 8-bit reference, whereas a Reinhard
+/// tone-map (what the EXR extractor uses) noticeably under-exposes SDR-range content.
+/// HDR values above 1.0 clip to white — acceptable for a thumbnail. NaN/negative inputs
+/// saturate to 0 via the clamp and the saturating `as u8` cast.
+fn linear_f32_to_u8(sample: &[u8]) -> u8 {
+    let v = f32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]).clamp(0.0, 1.0);
+    let srgb = if v <= 0.0031308 {
+        12.92 * v
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    // Round (not truncate): float error otherwise drops pure white to 254, and rounding
+    // is the less-biased quantization. srgb is in [0, 1], so this stays within 0..=255.
+    (srgb * 255.0).round() as u8
 }
 
 #[derive(Debug, Clone)]

@@ -2,23 +2,21 @@
 name = "psd"
 version = "0.3.5"
 authors = ["Chinedu Francis Nwafili <frankie.nwafili@gmail.com>"]
-description = "A Rust API for parsing and working with PSD files."
-keywords = ["psd", "photoshop", "texture", "png", "image"]
+description = "A Rust API for parsing and working with PSD and PSB files."
+keywords = ["psd", "psb", "photoshop", "texture", "image"]
 license = "MIT/Apache-2.0"
 repository = "https://github.com/chinedufn/psd"
 edition = "2018"
 
+# Vendored fork of the `psd` crate (chinedufn/psd v0.3.5) with added support for
+# Photoshop PSB (Large Document Format, version 2) files. See README.md.
+#
+# Lints are intentionally NOT inherited from the workspace: this is vendored
+# third-party code and we don't want the workspace's `warnings = "deny"` to break
+# builds on upstream warnings we haven't audited.
+
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 anyhow = "1"
-
-[workspace]
-members = [
-    "examples/drag-drop-browser"
-]
-
-[profile.release]
-# We can re-enable lto for the demo when wasm-pack 0.2.38 is released. There's a bug in 0.2.37
-# lto = true

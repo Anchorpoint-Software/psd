@@ -3,6 +3,7 @@ use std::ops::Range;
 
 use crate::psd_channel::PsdChannelCompression;
 use crate::psd_channel::PsdChannelKind;
+use crate::sections::file_header_section::PsdVersion;
 use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::layer_and_mask_information_section::groups::Groups;
 use crate::sections::layer_and_mask_information_section::layer::{
@@ -21,6 +22,15 @@ const SIGNATURE_EIGHT_B64: [u8; 4] = [56, 66, 54, 52];
 const KEY_UNICODE_LAYER_NAME: &[u8; 4] = b"luni";
 /// Key of `Section divider setting (Photoshop 6.0)`, "lsct"
 const KEY_SECTION_DIVIDER_SETTING: &[u8; 4] = b"lsct";
+
+/// Additional Layer Information keys whose length field is 8 bytes (instead of 4)
+/// in a PSB file. (Photoshop CS / Large Document Format.)
+///
+/// Per the Adobe spec: "the following keys have a length count of 8 bytes" in PSB.
+const PSB_EIGHT_BYTE_LEN_KEYS: [&[u8; 4]; 13] = [
+    b"LMsk", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2", b"FEid", b"FXid", b"PxSD",
+    b"Lr16", b"Lr32", b"Layr",
+];
 
 pub mod groups;
 pub mod layer;
@@ -75,17 +85,18 @@ impl LayerAndMaskInformationSection {
         bytes: &[u8],
         psd_width: u32,
         psd_height: u32,
+        version: PsdVersion,
     ) -> Result<LayerAndMaskInformationSection, PsdLayerError> {
         let mut cursor = PsdCursor::new(bytes);
 
-        // The first four bytes of the section is the length marker for the layer and mask
-        // information section.
+        // The first bytes of the section are the length marker for the layer and mask
+        // information section. This is 4 bytes in a PSD and 8 bytes in a PSB.
         //
         // We do not currently use it since the number of bytes passed into this function was
         // the exact number of bytes in the layer and information mask section of the PSD file,
         // so there's no way for us to accidentally read too many bytes. If we did the program
         // would panic.
-        let len = cursor.read_u32();
+        let len = cursor.read_psb_aware_len(version.is_psb());
 
         if len == 0 {
             return Ok(LayerAndMaskInformationSection {
@@ -94,8 +105,22 @@ impl LayerAndMaskInformationSection {
             });
         }
 
-        // Read the next four bytes to get the length of the layer info section.
-        let _layer_info_section_len = cursor.read_u32();
+        // Read the length of the layer info section. 4 bytes in a PSD, 8 bytes in a PSB.
+        let layer_info_section_len = cursor.read_psb_aware_len(version.is_psb());
+
+        // A zero layer-info length means there are no layers in the main layer-info
+        // block — the file is flattened (only global mask / additional-info follows), or
+        // a large document (16/32-bit) stores its layers in an 'Lr16'/'Lr32' tagged block
+        // we don't parse. Either way there is no inline layer count to read; reading one
+        // would run off the end of the section. The composite still renders, but the
+        // metadata layer count for such files is reported as 0 — see the note in the
+        // README / CHANGELOG.
+        if layer_info_section_len == 0 {
+            return Ok(LayerAndMaskInformationSection {
+                layers: Layers::new(),
+                groups: Groups::with_capacity(0),
+            });
+        }
 
         // Next 2 bytes is the layer count
         //
@@ -113,7 +138,7 @@ impl LayerAndMaskInformationSection {
         // PSD and make sure that we're handling this case properly.
         let layer_count: u16 = layer_count.abs() as u16;
         let (group_count, layer_records) =
-            LayerAndMaskInformationSection::read_layer_records(&mut cursor, layer_count)?;
+            LayerAndMaskInformationSection::read_layer_records(&mut cursor, layer_count, version)?;
 
         LayerAndMaskInformationSection::decode_layers(
             layer_records,
@@ -204,13 +229,14 @@ impl LayerAndMaskInformationSection {
     fn read_layer_records(
         cursor: &mut PsdCursor,
         layer_count: u16,
+        version: PsdVersion,
     ) -> Result<(usize, Vec<(LayerRecord, LayerChannels)>), PsdLayerError> {
         let mut groups_count = 0;
 
         let mut layer_records = vec![];
         // Read each layer record
         for _layer_num in 0..layer_count {
-            let layer_record = read_layer_record(cursor)?;
+            let layer_record = read_layer_record(cursor, version)?;
 
             match layer_record.divider_type {
                 Some(GroupDivider::BoundingSection) => {
@@ -228,6 +254,7 @@ impl LayerAndMaskInformationSection {
                 cursor,
                 &layer_record.channel_data_lengths,
                 layer_record.height() as usize,
+                version,
             )?;
 
             result.push((layer_record, channels));
@@ -259,9 +286,13 @@ fn read_layer_channels(
     cursor: &mut PsdCursor,
     channel_data_lengths: &Vec<(PsdChannelKind, u32)>,
     scanlines: usize,
+    version: PsdVersion,
 ) -> Result<LayerChannels, PsdLayerError> {
     let capacity = channel_data_lengths.len();
     let mut channels = HashMap::with_capacity(capacity);
+
+    // Per-scanline RLE byte counts are 2 bytes in a PSD and 4 bytes in a PSB.
+    let scanline_count_bytes = version.rle_scanline_len_bytes();
 
     for (channel_kind, channel_length) in channel_data_lengths.iter() {
         let compression = cursor.read_u16();
@@ -282,12 +313,17 @@ fn read_layer_channels(
                 // we don't currently use them. We might re-think this in the future when we
                 // implement serialization of a Psd back into bytes.. But not a concern at the
                 // moment.
-                // Compressed bytes per scanline are encoded at the beginning as 2 bytes
-                // per scanline
-                let channel_data = &channel_data[2 * scanlines..];
+                // Compressed bytes per scanline are encoded at the beginning, one entry per
+                // scanline (2 bytes per entry in a PSD, 4 bytes per entry in a PSB).
+                let skip = scanline_count_bytes * scanlines;
+                let channel_data = channel_data.get(skip..).unwrap_or(&[]);
                 ChannelBytes::RleCompressed(channel_data.into())
             }
-            _ => unimplemented!("Zip compression currently unsupported"),
+            // ZIP-compressed layer channels (2 = without prediction, 3 = with) are not
+            // decoded. Degrade to an empty channel so the file still parses and its
+            // composite renders, instead of panicking and losing the thumbnail. (We
+            // never decode per-layer pixels for thumbnails — only the merged composite.)
+            _ => ChannelBytes::RawData(Vec::new()),
         };
 
         channels.insert(*channel_kind, channel_bytes);
@@ -322,7 +358,10 @@ fn read_layer_channels(
 /// | Variable               | Layer mask data: See See Layer mask / adjustment layer data for structure. Can be 40 bytes, 24 bytes, or 4 bytes if no layer mask.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 /// | Variable               | Layer blending ranges: See See Layer blending ranges data.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 /// | Variable               | Layer name: Pascal string, padded to a multiple of 4 bytes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerError> {
+fn read_layer_record(
+    cursor: &mut PsdCursor,
+    version: PsdVersion,
+) -> Result<LayerRecord, PsdLayerError> {
     let mut channel_data_lengths = vec![];
 
     // FIXME:
@@ -356,10 +395,11 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         let channel_id =
             PsdChannelKind::new(channel_id).ok_or(PsdLayerError::InvalidChannel { channel_id })?;
 
-        let channel_length = cursor.read_u32();
+        // Length of the corresponding channel data: 4 bytes in a PSD, 8 bytes in a PSB.
+        let channel_length = cursor.read_psb_aware_len(version.is_psb());
         // The first two bytes encode the compression, the rest of the bytes
-        // are the channel data.
-        let channel_data_length = channel_length - 2;
+        // are the channel data. saturating_sub guards a malformed length < 2.
+        let channel_data_length = channel_length.saturating_sub(2);
 
         channel_data_lengths.push((channel_id, channel_data_length));
     }
@@ -368,7 +408,8 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     cursor.read_4();
 
     let mut key = [0; 4];
-    key.copy_from_slice(cursor.read_4());
+    let key_bytes = cursor.read_4();
+    key[..key_bytes.len()].copy_from_slice(key_bytes);
     let blend_mode = match BlendMode::match_mode(key) {
         Some(v) => v,
         None => return Err(PsdLayerError::UnknownBlendingMode { mode: key }),
@@ -413,9 +454,11 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     // after it. Here we skip over those throwaday bytes.
     //
     // The 1 is the 1 byte that we read for the name length
-    let bytes_mod_4 = (name_len + 1) % 4;
+    // 1 byte for the length prefix + name bytes, rounded up to a multiple of 4.
+    // Compute in u32 so a 255-byte name can't overflow the u8 add.
+    let bytes_mod_4 = (name_len as u32 + 1) % 4;
     let padding = (4 - bytes_mod_4) % 4;
-    cursor.read(padding as u32);
+    cursor.read(padding);
 
     let mut divider_type = None;
     // There can be multiple additional layer information sections so we'll loop
@@ -423,8 +466,12 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
         let _signature = cursor.read_4();
         let mut key = [0; 4];
-        key.copy_from_slice(cursor.read_4());
-        let additional_layer_info_len = cursor.read_u32();
+        let key_bytes = cursor.read_4();
+        key[..key_bytes.len()].copy_from_slice(key_bytes);
+        // Most additional-layer-info length fields are 4 bytes. In a PSB a handful of
+        // large-document keys (Lr16, Lr32, Layr, LMsk, ...) use an 8-byte length instead.
+        let eight_byte_len = version.is_psb() && PSB_EIGHT_BYTE_LEN_KEYS.contains(&&key);
+        let additional_layer_info_len = cursor.read_psb_aware_len(eight_byte_len);
 
         match &key {
             KEY_UNICODE_LAYER_NAME => {

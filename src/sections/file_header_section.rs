@@ -3,8 +3,10 @@ use thiserror::Error;
 
 /// Bytes representing the string "8BPS".
 pub const EXPECTED_PSD_SIGNATURE: [u8; 4] = [56, 66, 80, 83];
-/// Bytes representing the number 1
-const EXPECTED_VERSION: [u8; 2] = [0, 1];
+/// Bytes representing the number 1 (PSD)
+const EXPECTED_VERSION_PSD: [u8; 2] = [0, 1];
+/// Bytes representing the number 2 (PSB / Large Document Format)
+const EXPECTED_VERSION_PSB: [u8; 2] = [0, 2];
 /// Bytes representing the Reserved section of the header
 const EXPECTED_RESERVED: [u8; 6] = [0; 6];
 
@@ -91,11 +93,17 @@ impl FileHeaderSection {
             return Err(FileHeaderSectionError::InvalidSignature {});
         }
 
-        // The next 2 bytes represent the version
-        let version = cursor.read_2();
-        if version != EXPECTED_VERSION {
+        // The next 2 bytes represent the version. 1 = PSD, 2 = PSB.
+        let version_bytes = cursor.read_2();
+        let mut version_arr = [0u8; 2];
+        version_arr.copy_from_slice(version_bytes);
+        let version = if version_arr == EXPECTED_VERSION_PSD {
+            PsdVersion::One
+        } else if version_arr == EXPECTED_VERSION_PSB {
+            PsdVersion::Two
+        } else {
             return Err(FileHeaderSectionError::InvalidVersion {});
-        }
+        };
 
         // The next 6 bytes are reserved and should always be 0
         let reserved = cursor.read_6();
@@ -108,15 +116,15 @@ impl FileHeaderSection {
         let channel_count = ChannelCount::new(channel_count)
             .ok_or(FileHeaderSectionError::ChannelCountOutOfRange { channel_count })?;
 
-        // 4 bytes for the height
+        // 4 bytes for the height. PSB allows a larger maximum (300,000) than PSD (30,000).
         let height = cursor.read_u32();
-        let height =
-            PsdHeight::new(height).ok_or(FileHeaderSectionError::HeightOutOfRange { height })?;
+        let height = PsdHeight::new(height, version)
+            .ok_or(FileHeaderSectionError::HeightOutOfRange { height })?;
 
-        // 4 bytes for the width
+        // 4 bytes for the width. PSB allows a larger maximum (300,000) than PSD (30,000).
         let width = cursor.read_u32();
-        let width =
-            PsdWidth::new(width).ok_or(FileHeaderSectionError::WidthOutOfRange { width })?;
+        let width = PsdWidth::new(width, version)
+            .ok_or(FileHeaderSectionError::WidthOutOfRange { width })?;
 
         // 2 bytes for depth
         let depth = cursor.read_2()[1];
@@ -128,7 +136,7 @@ impl FileHeaderSection {
             .ok_or(FileHeaderSectionError::InvalidColorMode { color_mode })?;
 
         let file_header_section = FileHeaderSection {
-            version: PsdVersion::One,
+            version,
             channel_count,
             width,
             height,
@@ -138,6 +146,11 @@ impl FileHeaderSection {
 
         Ok(file_header_section)
     }
+
+    /// The version of the file (PSD vs PSB).
+    pub fn version(&self) -> PsdVersion {
+        self.version
+    }
 }
 
 /// # [Adobe Docs](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)
@@ -145,10 +158,33 @@ impl FileHeaderSection {
 /// Version: always equal to 1. Do not try to read the file if the version does not match this value. (**PSB** version is 2.)
 ///
 /// via: https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PsdVersion {
     /// Regular PSD (Not a PSB)
     One,
+    /// PSB (Large Document Format)
+    ///
+    /// Several length fields that are 4 bytes in a PSD are widened to 8 bytes in a PSB,
+    /// and the RLE scanline byte counts widen from 2 bytes to 4 bytes.
+    Two,
+}
+
+impl PsdVersion {
+    /// `true` if this is a PSB (Large Document Format) file.
+    pub fn is_psb(self) -> bool {
+        matches!(self, PsdVersion::Two)
+    }
+
+    /// The byte width of one RLE scanline byte-count entry.
+    ///
+    /// 2 bytes for PSD, 4 bytes for PSB.
+    pub(in crate) fn rle_scanline_len_bytes(self) -> usize {
+        if self.is_psb() {
+            4
+        } else {
+            2
+        }
+    }
 }
 
 /// # [Adobe Docs](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)
@@ -185,9 +221,12 @@ impl ChannelCount {
 pub struct PsdHeight(pub(in crate) u32);
 
 impl PsdHeight {
-    /// Create a new PsdHeight
-    pub fn new(height: u32) -> Option<PsdHeight> {
-        if height < 1 || height > 30000 {
+    /// Create a new PsdHeight.
+    ///
+    /// PSD supports a maximum of 30,000; PSB supports a maximum of 300,000.
+    pub fn new(height: u32, version: PsdVersion) -> Option<PsdHeight> {
+        let max = if version.is_psb() { 300_000 } else { 30_000 };
+        if height < 1 || height > max {
             return None;
         }
 
@@ -205,9 +244,12 @@ impl PsdHeight {
 pub struct PsdWidth(pub(in crate) u32);
 
 impl PsdWidth {
-    /// Create a new PsdWidth
-    pub fn new(width: u32) -> Option<PsdWidth> {
-        if width < 1 || width > 30000 {
+    /// Create a new PsdWidth.
+    ///
+    /// PSD supports a maximum of 30,000; PSB supports a maximum of 300,000.
+    pub fn new(width: u32, version: PsdVersion) -> Option<PsdWidth> {
+        let max = if version.is_psb() { 300_000 } else { 30_000 };
+        if width < 1 || width > max {
             return None;
         }
 
@@ -340,7 +382,7 @@ mod tests {
     fn invalid_reserved_section() {
         let mut bytes = make_bytes();
         bytes[0..4].copy_from_slice(&EXPECTED_PSD_SIGNATURE);
-        bytes[4..6].copy_from_slice(&EXPECTED_VERSION);
+        bytes[4..6].copy_from_slice(&EXPECTED_VERSION_PSD);
 
         match error_from_bytes(&bytes) {
             FileHeaderSectionError::InvalidReserved {} => {}

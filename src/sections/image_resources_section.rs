@@ -44,24 +44,34 @@ impl ImageResourcesSection {
         let mut resources = vec![];
 
         let length = cursor.read_u32() as u64;
+        // Reads clamp to the buffer, so also bound the loop by the actual slice length:
+        // a truncated section must not spin forever, and we must not assert on a position
+        // a malformed file can't reach. Image resources aren't needed to render the
+        // composite, so partial results are acceptable.
+        let buf_len = cursor.get_ref().len() as u64;
 
-        while cursor.position() < length {
+        while cursor.position() < length && cursor.position() < buf_len {
+            let pos_before = cursor.position();
             let block = ImageResourcesSection::read_resource_block(&mut cursor)?;
 
             let rid = block.resource_id;
             match rid {
                 _ if rid == RESOURCE_SLICES_INFO => {
-                    let slices_image_resource = ImageResourcesSection::read_slice_block(
-                        &cursor.get_ref()[block.data_range],
-                    )
-                    .map_err(ImageResourcesSectionError::InvalidResource)?;
-                    resources.push(ImageResource::Slices(slices_image_resource));
+                    if let Some(slice_bytes) = cursor.get_ref().get(block.data_range) {
+                        let slices_image_resource =
+                            ImageResourcesSection::read_slice_block(slice_bytes)
+                                .map_err(ImageResourcesSectionError::InvalidResource)?;
+                        resources.push(ImageResource::Slices(slices_image_resource));
+                    }
                 }
                 _ => {}
             }
-        }
 
-        assert_eq!(cursor.position(), length + 4);
+            // Stop if a block made no progress (truncated/malformed) to avoid an infinite loop.
+            if cursor.position() <= pos_before {
+                break;
+            }
+        }
 
         Ok(ImageResourcesSection { resources })
     }
@@ -89,8 +99,8 @@ impl ImageResourcesSection {
 
         let data_len = cursor.read_u32();
         let pos = cursor.position() as usize;
-        // Note: data length is padded to even.
-        let data_len = data_len + data_len % 2;
+        // Note: data length is padded to even. saturating_add guards a malformed max-value length.
+        let data_len = data_len.saturating_add(data_len % 2);
         let data_range = Range {
             start: pos,
             end: pos + data_len as usize,
