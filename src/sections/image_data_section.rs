@@ -168,14 +168,18 @@ impl ImageDataSection {
                 let (red_start, red_end) =
                     (channel_data_start, channel_data_start + red_byte_count);
 
-                let red = bytes[red_start..red_end].into();
+                // Channel offsets derive from the header (channel_data_start depends on
+                // psd_height, not the buffer length), so a truncated or malformed RLE
+                // section can push these past the end. Slice defensively — an out-of-range
+                // channel degrades to empty rather than panicking (mirrors the layer path).
+                let red = bytes.get(red_start..red_end).unwrap_or(&[]).into();
 
                 let green = match green_byte_count {
                     Some(green_byte_count) => {
                         let green_start = red_end;
                         let green_end = green_start + green_byte_count;
                         Some(ChannelBytes::RleCompressed(
-                            bytes[green_start..green_end].into(),
+                            bytes.get(green_start..green_end).unwrap_or(&[]).into(),
                         ))
                     }
                     None => None,
@@ -186,7 +190,7 @@ impl ImageDataSection {
                         let blue_start = red_end + green_byte_count.unwrap();
                         let blue_end = blue_start + blue_byte_count;
                         Some(ChannelBytes::RleCompressed(
-                            bytes[blue_start..blue_end].into(),
+                            bytes.get(blue_start..blue_end).unwrap_or(&[]).into(),
                         ))
                     }
                     None => None,
@@ -198,7 +202,7 @@ impl ImageDataSection {
                             red_end + green_byte_count.unwrap() + blue_byte_count.unwrap();
                         let alpha_end = alpha_start + alpha_byte_count;
                         Some(ChannelBytes::RleCompressed(
-                            bytes[alpha_start..alpha_end].into(),
+                            bytes.get(alpha_start..alpha_end).unwrap_or(&[]).into(),
                         ))
                     }
                     None => None,

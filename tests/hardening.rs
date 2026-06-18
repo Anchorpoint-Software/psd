@@ -44,6 +44,23 @@ fn raw_image_data(planes: &[&[u8]]) -> Vec<u8> {
     d
 }
 
+/// RLE-compressed image-data section for `channels` whole-canvas channels of `height`
+/// scanlines. The packed payload is filler — `Psd::from_bytes` slices the channel data
+/// out of the section but does not decode the packed bytes, so only the scanline
+/// byte-count table and the resulting section length matter for exercising the composite
+/// RLE slicing under truncation.
+fn rle_image_data(height: u32, channels: u16) -> Vec<u8> {
+    let scanline_len: u16 = 3; // arbitrary per-scanline packed length
+    let mut d = Vec::new();
+    push_u16(&mut d, 1); // compression 1 == RLE
+    for _ in 0..(channels as u32 * height) {
+        push_u16(&mut d, scanline_len); // per-scanline byte count (PSD: 2 bytes each)
+    }
+    let packed = channels as usize * height as usize * scanline_len as usize;
+    d.extend(std::iter::repeat(0u8).take(packed));
+    d
+}
+
 /// Assemble a complete PSD from a layer-and-mask section (including its own length
 /// marker) and an image-data section.
 fn assemble(header: Vec<u8>, layer_and_mask: &[u8], image_data: &[u8]) -> Vec<u8> {
@@ -272,6 +289,34 @@ fn truncating_a_valid_psd_at_any_offset_never_panics() {
         assert!(
             result.is_ok(),
             "Psd::from_bytes panicked on a buffer truncated to {cut} bytes"
+        );
+    }
+}
+
+#[test]
+fn truncating_a_valid_rle_psd_at_any_offset_never_panics() {
+    // The composite RLE path computes channel offsets from the header (channel_data_start
+    // depends on psd_height, not the buffer length), so a truncated RLE image-data section
+    // must be sliced defensively. The raw fuzz above never exercises this path.
+    let header = psd_header(2, 2, 3, 8, 3);
+    let no_layers = {
+        let mut s = Vec::new();
+        push_u32(&mut s, 0);
+        s
+    };
+    let image_data = rle_image_data(2, 3);
+    let full = assemble(header, &no_layers, &image_data);
+
+    Psd::from_bytes(&full).expect("baseline RLE buffer must parse");
+
+    for cut in 0..=full.len() {
+        let slice = full[..cut].to_vec();
+        let result = std::panic::catch_unwind(|| {
+            let _ = Psd::from_bytes(&slice);
+        });
+        assert!(
+            result.is_ok(),
+            "Psd::from_bytes panicked on an RLE buffer truncated to {cut} bytes"
         );
     }
 }
